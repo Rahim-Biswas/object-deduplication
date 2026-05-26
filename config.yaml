@@ -1,0 +1,34 @@
+# Camera intrinsics (DJI Mavic 3 example — replace with your drone model)
+camera:
+  fx: 2873.0
+  fy: 2873.0
+  cx: 2016.0     # image_width / 2
+  cy: 1512.0     # image_height / 2
+  image_w: 4032
+  image_h: 3024
+
+# Known real-world heights of each component in metres
+component_sizes:
+  RRU: 0.35
+  microwave_dish: 0.60
+  antenna_panel: 1.20
+  ODU: 0.25
+
+# Deduplication thresholds
+dedup:
+  dbscan_eps: 0.35
+  dbscan_min_samples: 2
+  spatial_weight: 0.55
+  visual_weight: 0.45
+  spatial_scale_m: 2.0
+  singleton_conf_threshold: 0.75
+
+# YOLO settings
+yolo:
+  model_path: "models/tower_yolo_t1.pt"
+  conf_threshold: 0.35
+  iou_threshold: 0.45
+
+# Max image dimension for processing (helps with memory usage on large images)
+# Larger images will be resized maintaining aspect ratio
+max_image_size: 640  # Reduced from 1280 to avoid memory exhaustion
