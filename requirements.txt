@@ -1,0 +1,9 @@
+ultralytics 
+opencv-python-headless
+scipy
+scikit-learn 
+torchreid
+pyexiftool 
+pyyaml 
+tqdm 
+rich
