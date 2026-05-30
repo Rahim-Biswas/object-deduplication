@@ -3,8 +3,11 @@ opencv-python-headless
 scipy
 scikit-learn 
 torchreid
-pyexiftool 
-pyyaml 
+pyexiftool  
 pyyaml 
 rich
-tensorboardcl
+tensorboard
+gdown
+dotenv
+boto3
+asyncpg
