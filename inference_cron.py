@@ -73,9 +73,9 @@ logger = logging.getLogger("visionx-cron")
 # Config
 # ---------------------------------------------------------------------------
 
-ASSET_MODEL_PATH  = os.getenv("ASSET_MODEL_PATH",  "models/asset-detection-best.pt")
-DEFECT_MODEL_PATH = os.getenv("DEFECT_MODEL_PATH", "models/defect-detection-best.pt")
-INFERENCE_CONF    = float(os.getenv("INFERENCE_CONF", "0.4"))
+ASSET_MODEL_PATH  = os.getenv("ASSET_MODEL_PATH",  "models/tower_asset_detection_v1.pt")
+DEFECT_MODEL_PATH = os.getenv("DEFECT_MODEL_PATH", "models/tower_defect_detection_v1.pt")
+INFERENCE_CONF    = float(os.getenv("INFERENCE_CONF", "0.8"))
 
 POLL_INTERVAL    = int(os.getenv("CRON_POLL_INTERVAL",  "60"))
 # Note: BATCH_SIZE is no longer used for fetching files, we process by inspection.
