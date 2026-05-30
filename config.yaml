@@ -25,7 +25,7 @@ dedup:
 
 # YOLO settings
 yolo:
-  model_path: "models/tower_yolo_t1.pt"
+  model_path: "models/tower_asset_detection_v1.pt"
   conf_threshold: 0.35
   iou_threshold: 0.45
 
