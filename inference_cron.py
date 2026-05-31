@@ -162,13 +162,12 @@ CREATE TABLE IF NOT EXISTS detection (
 
 # Atomically claim all 'uploaded' mobile_images for ONE inspection.
 # pvx_file links to inspection via the pvx_inspection_file join table.
-# (pvx_inspection has been renamed to `inspection` in the new schema.)
 CLAIM_INSPECTION_SQL = """
 WITH target_inspection AS (
     SELECT insp_sub.id::text AS inspection_id
     FROM pvx_file f_sub
     JOIN pvx_inspection_file inf_sub ON inf_sub.file_id = f_sub.id
-    JOIN inspection insp_sub ON insp_sub.id::text = inf_sub.inspection_id::text
+    JOIN pvx_inspection insp_sub ON insp_sub.id::text = inf_sub.inspection_id::text
     WHERE f_sub.status    = 'uploaded'
       AND f_sub.file_type = 'mobile_images'
       AND f_sub.is_deleted = false
@@ -181,7 +180,7 @@ SELECT
     insp.tower_id
 FROM pvx_file f
 JOIN pvx_inspection_file inf ON inf.file_id = f.id
-JOIN inspection insp ON insp.id::text = inf.inspection_id::text
+JOIN pvx_inspection insp ON insp.id::text = inf.inspection_id::text
 WHERE f.status     = 'uploaded'
   AND f.file_type  = 'mobile_images'
   AND f.is_deleted = false
@@ -337,11 +336,11 @@ async def _update_inspection_asset_counts(
     inspection_id: str,
     asset_counts: Dict[str, int],
 ) -> None:
-    """Update the inspection.asset_counts JSONB column with final deduplicated totals.
+    """Update the pvx_inspection.asset_counts JSONB column with final deduplicated totals.
     Format: {"<component_uuid>": <total_count>}
     """
     await conn.execute(
-        """UPDATE inspection
+        """UPDATE pvx_inspection
                SET asset_counts = $1::jsonb
              WHERE id = $2::uuid""",
         json.dumps(asset_counts),
