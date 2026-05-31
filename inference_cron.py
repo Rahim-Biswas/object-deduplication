@@ -581,101 +581,145 @@ async def _tick(
 # ---------------------------------------------------------------------------
 
 async def _process_manual_s3_path(s3_client: Any, bucket: str, prefix: str) -> None:
+    """
+    Process images from a manual S3 prefix (no DB).
+
+    Outputs are written to:
+        {FOLDER_NAME}/{input_folder_name}/detection/{filename}
+    where input_folder_name is the last segment of the input prefix.
+
+    Only UNIQUE (deduplicated) images are annotated and uploaded.
+    """
     logger.info(f"Listing objects in s3://{bucket}/{prefix}")
-    
+
     # Ensure prefix ends with /
     if not prefix.endswith("/"):
         prefix += "/"
-        
+
+    # Derive input folder name from the last non-empty segment of the prefix
+    # e.g. "towers/site_abc/images/" -> "images"
+    folder_name   = os.getenv("FOLDER_NAME", "deep_learning").strip("'\"")
+    input_folder  = [p for p in prefix.rstrip("/").split("/") if p][-1]
+    output_prefix = f"{folder_name}/{input_folder}/detection/"
+
     response = await asyncio.to_thread(s3_client.list_objects_v2, Bucket=bucket, Prefix=prefix)
-    
+
     if "Contents" not in response:
         logger.warning("No files found in the specified S3 path.")
         return
-        
+
     s3_keys = [obj["Key"] for obj in response["Contents"] if obj["Key"].lower().endswith(".jpg")]
-    
+
     if not s3_keys:
         logger.warning("No JPG images found in the specified S3 path.")
         return
-        
-    logger.info(f"Found {len(s3_keys)} images. Initializing pipeline...")
-    modules = await asyncio.to_thread(_init_pipeline)
+
+    logger.info(f"Found {len(s3_keys)} images. Output will go to s3://{bucket}/{output_prefix}")
+
+    modules  = await asyncio.to_thread(_init_pipeline)
     detector = modules["detector"]
-    fuser = modules["fuser"]
-    deduper = modules["deduper"]
-    
+    fuser    = modules["fuser"]
+    deduper  = modules["deduper"]
+
+    # filename -> {local_path, raw_dets} -- store everything; upload ONLY unique ones later
+    file_info: Dict[str, Dict] = {}
     all_fused_detections = []
-    
+
     with tempfile.TemporaryDirectory() as tmpdir:
+        # ------------------------------------------------------------------
+        # Pass 1: download, detect, fuse -- do NOT upload yet
+        # ------------------------------------------------------------------
         for s3_url in s3_keys:
-            filename = s3_url.split("/")[-1]
+            filename   = s3_url.split("/")[-1]
             local_path = os.path.join(tmpdir, filename)
-            
+            file_info[filename] = {"local_path": local_path, "raw_dets": []}
+
             try:
                 logger.info(f"Downloading {s3_url}")
                 await asyncio.to_thread(_s3_download_to_file, s3_client, bucket, s3_url, local_path)
-                
+
                 pose = await asyncio.to_thread(parse_dji_metadata, local_path)
                 dets = await asyncio.to_thread(detector.detect, local_path)
-                
+
                 if dets:
                     fused_dets = await asyncio.to_thread(fuser.fuse, dets, pose)
                     for d in fused_dets:
                         d.frame_id = filename
                     all_fused_detections.extend(fused_dets)
-                    
-                    img = await asyncio.to_thread(cv2.imread, local_path)
-                    dict_dets = [
-                        {
-                            "class_name": d.class_name, 
-                            "confidence": d.confidence, 
-                            "bbox": d.bbox.tolist()
-                        } 
-                        for d in dets
-                    ]
-                    annotated = await asyncio.to_thread(_annotate, img, dict_dets)
-                    
-                    output_key = f"{prefix}detection/{filename}"
-                    logger.info(f"Uploading annotated image to {output_key}")
-                    await asyncio.to_thread(_s3_upload, s3_client, bucket, annotated, output_key)
+                    file_info[filename]["raw_dets"] = dets
+
             except Exception as e:
                 logger.error(f"Error processing {s3_url}: {e}")
             finally:
                 gc.collect()
 
+        # ------------------------------------------------------------------
+        # Pass 2: global deduplication
+        # ------------------------------------------------------------------
         logger.info(f"Deduplicating {len(all_fused_detections)} total asset detections")
         inventory = await asyncio.to_thread(deduper.deduplicate, all_fused_detections)
-        
+
+        # Collect filenames that appear in any unique detection
+        unique_filenames: set = set()
+        for unique_dets in inventory.values():
+            for d in unique_dets:
+                unique_filenames.add(d.frame_id)
+
+        total        = len(s3_keys)
+        unique_count = len(unique_filenames)
+        logger.info(f"{unique_count} unique images after deduplication (skipped {total - unique_count})")
+
+        # ------------------------------------------------------------------
+        # Pass 3: annotate and upload ONLY unique images
+        # ------------------------------------------------------------------
+        for filename in unique_filenames:
+            info       = file_info[filename]
+            local_path = info["local_path"]
+            raw_dets   = info["raw_dets"]
+            output_key = f"{output_prefix}{filename}"
+            try:
+                img = await asyncio.to_thread(cv2.imread, local_path)
+                dict_dets = [
+                    {"class_name": d.class_name, "confidence": d.confidence, "bbox": d.bbox.tolist()}
+                    for d in raw_dets
+                ]
+                annotated = await asyncio.to_thread(_annotate, img, dict_dets)
+                logger.info(f"Uploading unique annotated image -> s3://{bucket}/{output_key}")
+                await asyncio.to_thread(_s3_upload, s3_client, bucket, annotated, output_key)
+            except Exception as e:
+                logger.error(f"Error uploading unique image {filename}: {e}")
+
+        # ------------------------------------------------------------------
+        # Upload inventory JSON to same output folder
+        # ------------------------------------------------------------------
         report = {}
         for cls_name, unique_dets in inventory.items():
             report[cls_name] = {
                 "count": len(unique_dets),
                 "components": [
                     {
-                        "best_frame": d.frame_id,
-                        "confidence": round(d.confidence, 3),
-                        "world_xyz_m": d.world_xyz.tolist() if d.world_xyz is not None else [0,0,0],
-                        "bbox_pixels": d.bbox.tolist()
+                        "best_frame":  d.frame_id,
+                        "confidence":  round(d.confidence, 3),
+                        "world_xyz_m": d.world_xyz.tolist() if d.world_xyz is not None else [0, 0, 0],
+                        "bbox_pixels": d.bbox.tolist(),
                     }
                     for d in unique_dets
-                ]
+                ],
             }
-            
-        report_json = json.dumps(report, indent=2)
-        report_key = f"{prefix}detection/inventory.json"
-        
-        logger.info(f"Uploading deduplication inventory to {report_key}")
+
+        report_key = f"{output_prefix}inventory.json"
+        logger.info(f"Uploading deduplication inventory -> s3://{bucket}/{report_key}")
         await asyncio.to_thread(
             s3_client.put_object,
             Bucket=bucket,
             Key=report_key,
-            Body=report_json,
-            ContentType="application/json"
+            Body=json.dumps(report, indent=2),
+            ContentType="application/json",
         )
-        
+
         unique_counts = {k: len(v) for k, v in inventory.items()}
-        logger.info(f"Manual processing complete. Found unique components: {unique_counts}")
+        logger.info(f"Manual processing complete. Unique components: {unique_counts}")
+
 
 # ---------------------------------------------------------------------------
 # Entry point
