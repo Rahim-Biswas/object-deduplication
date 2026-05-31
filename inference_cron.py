@@ -177,9 +177,9 @@ WITH target_inspection AS (
     FROM pvx_file f_sub
     JOIN pvx_inspection_file inf_sub ON inf_sub.file_id = f_sub.id
     JOIN pvx_inspection insp_sub ON insp_sub.id::text = inf_sub.inspection_id::text
-    WHERE f_sub.status    = 'uploaded'
-      AND f_sub.file_type = 'mobile_images'
-      AND f_sub.is_deleted = false
+    WHERE f_sub.status ILIKE 'uploaded'
+      AND (f_sub.is_deleted = false OR f_sub.is_deleted IS NULL)
+      AND (f_sub.s3_url ILIKE '%.jpg' OR f_sub.s3_url ILIKE '%.jpeg')
     LIMIT 1
 )
 SELECT
@@ -190,9 +190,9 @@ SELECT
 FROM pvx_file f
 JOIN pvx_inspection_file inf ON inf.file_id = f.id
 JOIN pvx_inspection insp ON insp.id::text = inf.inspection_id::text
-WHERE f.status     = 'uploaded'
-  AND f.file_type  = 'mobile_images'
-  AND f.is_deleted = false
+WHERE f.status ILIKE 'uploaded'
+  AND (f.is_deleted = false OR f.is_deleted IS NULL)
+  AND (f.s3_url ILIKE '%.jpg' OR f.s3_url ILIKE '%.jpeg')
   AND insp.id::text = (SELECT inspection_id FROM target_inspection)
 FOR UPDATE OF f SKIP LOCKED;
 """
@@ -635,7 +635,7 @@ async def _tick(
                 )
 
     if not rows:
-        logger.info("[poll] No uploaded mobile_images found in pvx_file — sleeping for %ds.", POLL_INTERVAL)
+        logger.info("[poll] No uploaded .jpg images found in pvx_file — sleeping for %ds.", POLL_INTERVAL)
         return
 
     logger.info(f"Claimed {len(rows)} file(s) for inspection {rows[0]['inspection_id']} for processing.")
