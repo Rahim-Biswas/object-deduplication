@@ -120,7 +120,16 @@ def _init_pipeline():
             iou = cfg["yolo"].get("iou_threshold", 0.45)
             max_img_size = cfg.get("max_image_size", 1280)
 
+            logger.info(f"Loaded ASSET model:  {model_path} | conf={conf} | iou={iou}")
             _modules["detector"] = TowerDetector(model_path, conf, iou, max_image_size=max_img_size)
+            
+            # Defect uses env path and same default thresholds
+            defect_model_path = DEFECT_MODEL_PATH
+            defect_conf = conf
+            defect_iou = iou
+            logger.info(f"Loaded DEFECT model: {defect_model_path} | conf={defect_conf} | iou={defect_iou}")
+            _modules["defect_model"] = TowerDetector(defect_model_path, defect_conf, defect_iou, max_image_size=max_img_size)
+
             _modules["embedder"] = ReIDEmbedder()
             _modules["projector"] = Projector3D(cfg["camera"], cfg["component_sizes"])
             _modules["fuser"] = DetectionFuser(_modules["embedder"], _modules["projector"])
@@ -391,47 +400,92 @@ async def _process_inspection(
 
         with tempfile.TemporaryDirectory() as tmpdir:
 
-            # ------------------------------------------------------------------
-            # ASSETS — global deduplication pipeline
-            # ------------------------------------------------------------------
-            logger.info(f"[{inspection_id}] Processing {len(rows)} asset file(s) with deduplication")
+            logger.info(f"[{inspection_id}] Processing {len(rows)} file(s) concurrently (assets + defects)")
             detector = modules["detector"]
+            defect_model = modules["defect_model"]
             fuser    = modules["fuser"]
             deduper  = modules["deduper"]
 
-            # file_id → {s3_url, local_path, raw_dets, annotated_img}
+            # file_id → {s3_url, local_path, raw_dets}
             file_info: Dict[str, Dict] = {}
             all_fused_detections = []
+            
+            img_semaphore = asyncio.Semaphore(5)
 
-            for row in rows:
-                file_id    = str(row["id"])
-                s3_url     = row["s3_url"]
-                local_path = os.path.join(tmpdir, f"{file_id}.jpg")
+            async def _process_image(idx: int, row: asyncpg.Record):
+                async with img_semaphore:
+                    file_id    = str(row["id"])
+                    s3_url     = row["s3_url"]
+                    filename   = s3_url.split("/")[-1]
+                    local_path = os.path.join(tmpdir, f"{file_id}.jpg")
 
-                file_info[file_id] = {
-                    "s3_url":     s3_url,
-                    "local_path": local_path,
-                    "raw_dets":   [],
-                }
+                    logger.info(f"[{inspection_id}] [{idx}/{len(rows)}] Downloading: {filename}")
 
-                try:
-                    await asyncio.to_thread(
-                        _s3_download_to_file, s3_client, bucket, s3_url, local_path
-                    )
-                    pose = await asyncio.to_thread(parse_dji_metadata, local_path)
-                    dets = await asyncio.to_thread(detector.detect, local_path)
+                    try:
+                        await asyncio.to_thread(_s3_download_to_file, s3_client, bucket, s3_url, local_path)
+                        
+                        pose_task = asyncio.to_thread(parse_dji_metadata, local_path)
+                        asset_task = asyncio.to_thread(detector.detect, local_path)
+                        defect_task = asyncio.to_thread(defect_model.detect, local_path)
+                        
+                        pose, asset_dets, defect_dets = await asyncio.gather(pose_task, asset_task, defect_task)
 
-                    if dets:
-                        fused_dets = await asyncio.to_thread(fuser.fuse, dets, pose)
-                        for d in fused_dets:
-                            d.frame_id = file_id
-                        all_fused_detections.extend(fused_dets)
-                        file_info[file_id]["raw_dets"] = dets
+                        # --- DEFECT PIPELINE (No Deduplication) ---
+                        if defect_dets:
+                            defect_counts = {}
+                            for d in defect_dets:
+                                defect_counts[d.class_name] = defect_counts.get(d.class_name, 0) + 1
+                            breakdown = ", ".join(f"{cls}={cnt}" for cls, cnt in defect_counts.items())
+                            logger.info(f"[{inspection_id}] [{idx}/{len(rows)}] {filename}: {len(defect_dets)} DEFECT(s) [{breakdown}]")
+                            
+                            img = await asyncio.to_thread(cv2.imread, local_path)
+                            dict_dets = [{"class_name": d.class_name, "confidence": d.confidence, "bbox": d.bbox.tolist()} for d in defect_dets]
+                            annotated = await asyncio.to_thread(_annotate, img, dict_dets)
+                            defect_output_key = _output_key(s3_url, tower_id, inspection_id, "defect")
+                            await asyncio.to_thread(_s3_upload, s3_client, bucket, annotated, defect_output_key)
+                            
+                            # Write defect detection rows
+                            async with pool.acquire() as conn:
+                                async with conn.transaction():
+                                    for cls, cnt in defect_counts.items():
+                                        await _insert_detection(conn, inspection_id, defect_output_key, "defect", cls, cnt)
 
-                except Exception as e:
-                    logger.error(f"[{file_id}] Error in detection pass: {e}")
-                finally:
-                    gc.collect()
+                        # --- ASSET PIPELINE (With Deduplication) ---
+                        if asset_dets:
+                            asset_counts = {}
+                            for d in asset_dets:
+                                asset_counts[d.class_name] = asset_counts.get(d.class_name, 0) + 1
+                            breakdown = ", ".join(f"{cls}={cnt}" for cls, cnt in asset_counts.items())
+                            logger.info(f"[{inspection_id}] [{idx}/{len(rows)}] {filename}: {len(asset_dets)} ASSET(s) [{breakdown}]")
+                            
+                            fused_dets = await asyncio.to_thread(fuser.fuse, asset_dets, pose)
+                            for d in fused_dets:
+                                d.frame_id = file_id
+                                
+                            return file_id, s3_url, local_path, asset_dets, fused_dets
+                        else:
+                            logger.info(f"[{inspection_id}] [{idx}/{len(rows)}] {filename}: no ASSETS")
+                            return file_id, s3_url, local_path, [], []
+
+                    except Exception as e:
+                        logger.error(f"[{inspection_id}] [{idx}/{len(rows)}] Error processing {filename}: {e}")
+                        return None
+                    finally:
+                        gc.collect()
+
+            # Run all images concurrently (bounded by semaphore)
+            tasks = [_process_image(idx, row) for idx, row in enumerate(rows, 1)]
+            results = await asyncio.gather(*tasks)
+
+            for res in results:
+                if res:
+                    file_id, s3_url, local_path, raw_dets, fused_dets = res
+                    file_info[file_id] = {
+                        "s3_url": s3_url,
+                        "local_path": local_path,
+                        "raw_dets": raw_dets,
+                    }
+                    all_fused_detections.extend(fused_dets)
 
             # ------------------------------------------------------------------
             # Global deduplication
@@ -477,9 +531,11 @@ async def _process_inspection(
                     output_key = _output_key(s3_url, tower_id, inspection_id, "asset")
                     await asyncio.to_thread(_s3_upload, s3_client, bucket, annotated, output_key)
                     unique_output_keys[file_id] = output_key
-                    logger.debug(f"[{file_id}] Unique annotated image uploaded → {output_key}")
+                    logger.info(
+                        f"[{inspection_id}] Uploaded unique image → s3://{bucket}/{output_key}"
+                    )
                 except Exception as e:
-                    logger.error(f"[{file_id}] Error uploading unique image: {e}")
+                    logger.error(f"[{inspection_id}] Error uploading unique image [{file_id}]: {e}")
 
             # ------------------------------------------------------------------
             # Write DB records: `detection` rows + inspection.asset_counts
@@ -504,6 +560,7 @@ async def _process_inspection(
                                 frame_class_counts.get(d.frame_id, 0) + 1
                             )
 
+                        db_rows_written = 0
                         for frame_id, img_count in frame_class_counts.items():
                             output_key = unique_output_keys.get(frame_id, "")
                             if not output_key:
@@ -516,14 +573,28 @@ async def _process_inspection(
                                 class_name,
                                 img_count,
                             )
+                            db_rows_written += 1
+
+                        logger.info(
+                            f"[{inspection_id}] DB: '{class_name}' — "
+                            f"{len(unique_dets)} unique object(s), "
+                            f"{db_rows_written} detection row(s) inserted"
+                        )
 
                     # Update the inspection.asset_counts JSONB column
                     if asset_counts:
                         await _update_inspection_asset_counts(
                             conn, inspection_id, asset_counts
                         )
+                        lines = "\n".join(
+                            f"  {cn:30s}: {len(ud):>4d} unique"
+                            for cn, ud in inventory.items()
+                        )
+                        total_unique = sum(len(ud) for ud in inventory.values())
                         logger.info(
-                            f"[{inspection_id}] Updated asset_counts: {asset_counts}"
+                            f"[{inspection_id}] ===== FINAL ASSET COUNTS =====\n"
+                            + lines
+                            + f"\n  TOTAL                         : {total_unique:>4d} unique"
                         )
 
         # Mark all files as processed
@@ -564,7 +635,7 @@ async def _tick(
                 )
 
     if not rows:
-        logger.debug("No uploaded mobile_images found — sleeping.")
+        logger.info("[poll] No uploaded mobile_images found in pvx_file — sleeping for %ds.", POLL_INTERVAL)
         return
 
     logger.info(f"Claimed {len(rows)} file(s) for inspection {rows[0]['inspection_id']} for processing.")
@@ -627,34 +698,74 @@ async def _process_manual_s3_path(s3_client: Any, bucket: str, prefix: str) -> N
 
     with tempfile.TemporaryDirectory() as tmpdir:
         # ------------------------------------------------------------------
-        # Pass 1: download, detect, fuse -- do NOT upload yet
+        # Pass 1: Concurrent download, detect, fuse
         # ------------------------------------------------------------------
-        for s3_url in s3_keys:
-            filename   = s3_url.split("/")[-1]
-            local_path = os.path.join(tmpdir, filename)
-            file_info[filename] = {"local_path": local_path, "raw_dets": []}
-
-            try:
+        defect_model = modules["defect_model"]
+        img_semaphore = asyncio.Semaphore(5)
+        
+        async def _process_manual_image(s3_url: str):
+            async with img_semaphore:
+                filename   = s3_url.split("/")[-1]
+                local_path = os.path.join(tmpdir, filename)
+                
                 logger.info(f"Downloading {s3_url}")
-                await asyncio.to_thread(_s3_download_to_file, s3_client, bucket, s3_url, local_path)
+                try:
+                    await asyncio.to_thread(_s3_download_to_file, s3_client, bucket, s3_url, local_path)
 
-                pose = await asyncio.to_thread(parse_dji_metadata, local_path)
-                dets = await asyncio.to_thread(detector.detect, local_path)
+                    pose_task = asyncio.to_thread(parse_dji_metadata, local_path)
+                    asset_task = asyncio.to_thread(detector.detect, local_path)
+                    defect_task = asyncio.to_thread(defect_model.detect, local_path)
+                    
+                    pose, asset_dets, defect_dets = await asyncio.gather(pose_task, asset_task, defect_task)
 
-                if dets:
-                    fused_dets = await asyncio.to_thread(fuser.fuse, dets, pose)
-                    for d in fused_dets:
-                        d.frame_id = filename
-                    all_fused_detections.extend(fused_dets)
-                    file_info[filename]["raw_dets"] = dets
+                    # Handle DEFECTS
+                    if defect_dets:
+                        defect_counts = {}
+                        for d in defect_dets:
+                            defect_counts[d.class_name] = defect_counts.get(d.class_name, 0) + 1
+                        breakdown = ", ".join(f"{cls}={cnt}" for cls, cnt in defect_counts.items())
+                        logger.info(f"{filename}: {len(defect_dets)} DEFECT(s) [{breakdown}]")
+                        
+                        img = await asyncio.to_thread(cv2.imread, local_path)
+                        dict_dets = [{"class_name": d.class_name, "confidence": d.confidence, "bbox": d.bbox.tolist()} for d in defect_dets]
+                        annotated = await asyncio.to_thread(_annotate, img, dict_dets)
+                        defect_output_key = f"{output_prefix}defect_{filename}"
+                        await asyncio.to_thread(_s3_upload, s3_client, bucket, annotated, defect_output_key)
+                        
+                    # Handle ASSETS
+                    if asset_dets:
+                        asset_counts = {}
+                        for d in asset_dets:
+                            asset_counts[d.class_name] = asset_counts.get(d.class_name, 0) + 1
+                        breakdown = ", ".join(f"{cls}={cnt}" for cls, cnt in asset_counts.items())
+                        logger.info(f"{filename}: {len(asset_dets)} ASSET(s) [{breakdown}]")
+                        
+                        fused_dets = await asyncio.to_thread(fuser.fuse, asset_dets, pose)
+                        for d in fused_dets:
+                            d.frame_id = filename
+                            
+                        return filename, local_path, asset_dets, fused_dets
+                    else:
+                        logger.info(f"{filename}: no ASSETS")
+                        return filename, local_path, [], []
 
-            except Exception as e:
-                logger.error(f"Error processing {s3_url}: {e}")
-            finally:
-                gc.collect()
+                except Exception as e:
+                    logger.error(f"Error processing {s3_url}: {e}")
+                    return None
+                finally:
+                    gc.collect()
+
+        tasks = [_process_manual_image(s3_url) for s3_url in s3_keys]
+        results = await asyncio.gather(*tasks)
+        
+        for res in results:
+            if res:
+                filename, local_path, raw_dets, fused_dets = res
+                file_info[filename] = {"local_path": local_path, "raw_dets": raw_dets}
+                all_fused_detections.extend(fused_dets)
 
         # ------------------------------------------------------------------
-        # Pass 2: global deduplication
+        # Pass 2: global deduplication (Assets)
         # ------------------------------------------------------------------
         logger.info(f"Deduplicating {len(all_fused_detections)} total asset detections")
         inventory = await asyncio.to_thread(deduper.deduplicate, all_fused_detections)
