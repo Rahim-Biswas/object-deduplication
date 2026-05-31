@@ -1,25 +1,24 @@
 """
 PieflyVisionX — AI/ML Inference Cron Job (Deduplication Pipeline version)
 
-Polls pvx_file for uploaded groundbasemobileimages, runs YOLO detection,
+Polls pvx_file for uploaded mobile_images, runs YOLO detection,
 fuses and deduplicates asset detections, and writes results back to the portal database.
 
 Flow per inspection:
-  1. Find one inspection that has 'uploaded' groundbasemobileimages.
+  1. Find one inspection that has 'uploaded' mobile_images in pvx_file.
   2. Lock all 'uploaded' files for that inspection.
   3. Mark status = 'processing'.
-  4. Process 'asset' files using the global deduplication pipeline.
+  4. Process all files using the global deduplication pipeline:
      - Download files
      - Parse DJI pose
-     - YOLO detect
+     - YOLO detect (asset model)
      - ReID embed & back-project to 3D
      - Fuse & Deduplicate globally across the inspection
-  5. Process 'defect' files individually (no 3D deduplication).
-  6. Annotate images and upload results to S3.
-  7. Write global deduplicated pvx_detection rows and pvx_view_3d_annotation for assets.
-  8. Write per-image pvx_detection rows for defects.
-  9. Mark processed.
-  10. On failure → mark status = 'failed'
+  5. Write per-image rows to the `detection` table (for UI bounding-box display).
+  6. Upload ONLY unique-deduplicated annotated images to S3.
+  7. Update inspection.asset_counts JSONB with final per-component totals.
+  8. Mark processed.
+  9. On failure → mark status = 'failed'
 
 Environment variables (loaded from .env):
   ...
@@ -147,11 +146,10 @@ def _build_dsn() -> str:
 
 
 ENSURE_DETECTION_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS pvx_detection (
+CREATE TABLE IF NOT EXISTS detection (
     id             UUID         PRIMARY KEY DEFAULT gen_random_uuid(),
-    inspection_id  VARCHAR(255) NOT NULL,
+    inspection_id  UUID         NOT NULL,
     s3_url         VARCHAR(500) NOT NULL,
-    meta_data      JSONB,
     detection_type VARCHAR(50)  NOT NULL,
     component_name VARCHAR(255),
     detected_count INTEGER      DEFAULT 0,
@@ -162,32 +160,28 @@ CREATE TABLE IF NOT EXISTS pvx_detection (
 );
 """
 
-# Atomically claim all 'uploaded' files for ONE inspection
+# Atomically claim all 'uploaded' mobile_images for ONE inspection.
+# pvx_file now carries inspection_id directly (no join table needed).
 CLAIM_INSPECTION_SQL = """
 WITH target_inspection AS (
-    SELECT insp_sub.id::text AS inspection_id
+    SELECT f_sub.inspection_id::text
     FROM pvx_file f_sub
-    JOIN pvx_inspection_file inf_sub ON inf_sub.file_id = f_sub.id
-    JOIN pvx_inspection insp_sub ON insp_sub.id::text = inf_sub.inspection_id::text
-    WHERE f_sub.status = 'uploaded'
-      AND f_sub.file_type = 'groundbasemobileimages'
+    WHERE f_sub.status    = 'uploaded'
+      AND f_sub.file_type = 'mobile_images'
       AND f_sub.is_deleted = false
     LIMIT 1
 )
 SELECT
     f.id,
     f.s3_url,
-    f.ground_base_component_master_id,
-    f.view_3d_annotation_id,
-    insp.id       AS inspection_id,
+    f.inspection_id,
     insp.tower_id
 FROM pvx_file f
-JOIN pvx_inspection_file inf ON inf.file_id = f.id
-JOIN pvx_inspection insp ON insp.id::text = inf.inspection_id::text
-WHERE f.status = 'uploaded'
-  AND f.file_type = 'groundbasemobileimages'
+JOIN inspection insp ON insp.id = f.inspection_id
+WHERE f.status     = 'uploaded'
+  AND f.file_type  = 'mobile_images'
   AND f.is_deleted = false
-  AND insp.id::text = (SELECT inspection_id FROM target_inspection)
+  AND f.inspection_id::text = (SELECT inspection_id FROM target_inspection)
 FOR UPDATE OF f SKIP LOCKED;
 """
 
@@ -294,6 +288,7 @@ async def _mark_failed(conn: asyncpg.Connection, file_id: uuid.UUID) -> None:
 
 
 async def _upsert_component(conn: asyncpg.Connection, class_name: str) -> uuid.UUID:
+    """Upsert a component into pvx_ground_base_component_master and return its UUID."""
     name = class_name.title()
     code = class_name.upper().replace(" ", "_")
     row  = await conn.fetchrow(
@@ -308,60 +303,44 @@ async def _upsert_component(conn: asyncpg.Connection, class_name: str) -> uuid.U
     return row["id"]  # type: ignore[index]
 
 
-async def _insert_3d_annotation(
-    conn: asyncpg.Connection,
-    inspection_id: str,
-    component_id: uuid.UUID,
-    label: str,
-    world_xyz: List[float],
-) -> uuid.UUID:
-    """Create a 3D pin for an asset detection based on deduplicated world_xyz."""
-    # world_xyz from Projector3D is already in [east, north, up] in metres
-    # The portal expects certain conventions, mapping here:
-    # Based on old code:
-    # pos_x = round((bbox[0] + bbox[2]) / 200.0, 3)
-    # pos_y = round(-(bbox[1] + bbox[3]) / 200.0, 3)
-    # pos_z = round((bbox[3] - bbox[1]) / 5.0, 2)
-    # Since we have true metric coords now, we use world_xyz directly:
-    pos_x = round(world_xyz[0], 3)
-    pos_y = round(world_xyz[1], 3)
-    pos_z = round(world_xyz[2], 2)
-    
-    row   = await conn.fetchrow(
-        """INSERT INTO pvx_view_3d_annotation
-             (id, position_x, position_y, position_z, label,
-              inspection_id, ground_base_component_master_id,
-              created_by, created_date, is_active, is_deleted)
-           VALUES (gen_random_uuid(), $1, $2, $3, $4, $5, $6,
-                   'ai_ml_system', NOW(), true, false)
-           RETURNING id""",
-        pos_x, pos_y, pos_z, label, inspection_id, component_id,
-    )
-    return row["id"]  # type: ignore[index]
-
-
-async def _insert_pvx_detection(
+async def _insert_detection(
     conn: asyncpg.Connection,
     inspection_id: str,
     s3_url: str,
-    meta_data: Dict,
-    task_type: str,
-    class_name: str,
-    count: int,
+    detection_type: str,
+    component_name: str,
+    detected_count: int,
 ) -> None:
+    """Insert one row into the `detection` table for a single image + component."""
     await conn.execute(
-        """INSERT INTO pvx_detection
-             (inspection_id, s3_url, meta_data, detection_type,
+        """INSERT INTO detection
+             (inspection_id, s3_url, detection_type,
               component_name, detected_count,
               created_by, created_date, is_active, is_deleted)
-           VALUES ($1, $2, $3::jsonb, $4, $5, $6,
+           VALUES ($1::uuid, $2, $3, $4, $5,
                    'ai_ml_system', NOW(), true, false)""",
         inspection_id,
         s3_url,
-        json.dumps(meta_data),
-        task_type,
-        class_name.title(),
-        count,
+        detection_type,
+        component_name.title(),
+        detected_count,
+    )
+
+
+async def _update_inspection_asset_counts(
+    conn: asyncpg.Connection,
+    inspection_id: str,
+    asset_counts: Dict[str, int],
+) -> None:
+    """Update the inspection.asset_counts JSONB column with final deduplicated totals.
+    Format: {"<component_uuid>": <total_count>}
+    """
+    await conn.execute(
+        """UPDATE inspection
+               SET asset_counts = $1::jsonb
+             WHERE id = $2::uuid""",
+        json.dumps(asset_counts),
+        inspection_id,
     )
 
 
@@ -374,199 +353,178 @@ async def _process_inspection(
     s3_client: Any,
     rows: List[asyncpg.Record],
 ) -> None:
+    """
+    Process all mobile_images for one inspection end-to-end.
+
+    Asset flow (with global 3-D deduplication):
+      - Download → YOLO detect → fuse+embed → collect all detections
+      - Deduplicate globally across the inspection
+      - Upload ONLY the annotated images for unique (deduplicated) detections to S3
+      - Insert one `detection` row per image per component class
+      - Update inspection.asset_counts JSONB with final totals
+
+    Defect flow (per-image, no deduplication):
+      - Download → YOLO detect → annotate → upload to S3
+      - Insert one `detection` row per image per class
+    """
     if not rows:
         return
-        
+
     inspection_id = str(rows[0]["inspection_id"])
     tower_id      = str(rows[0]["tower_id"])
     bucket        = os.getenv("S3_BUCKET_NAME", "").strip("'\"")
 
     logger.info(f"[{inspection_id}] START processing {len(rows)} file(s)")
 
-    # 1. Mark all files as processing
+    # Mark all files as processing
     async with pool.acquire() as conn:
         for row in rows:
             await _mark_processing(conn, row["id"])
-
-    # Separate into asset vs defect
-    asset_rows = [r for r in rows if r["view_3d_annotation_id"] is None]
-    defect_rows = [r for r in rows if r["view_3d_annotation_id"] is not None]
 
     try:
         # Initialize pipeline modules (lazy load in thread)
         modules = await asyncio.to_thread(_init_pipeline)
 
-        # We need a temp directory to download images so exiftool and cv2 can read them
         with tempfile.TemporaryDirectory() as tmpdir:
-            
-            # -------------------------------------------------------------
-            # ASSETS (Pipeline logic with deduplication)
-            # -------------------------------------------------------------
-            if asset_rows:
-                logger.info(f"[{inspection_id}] Processing {len(asset_rows)} asset file(s)")
-                detector = modules["detector"]
-                fuser = modules["fuser"]
-                deduper = modules["deduper"]
-                
-                all_fused_detections = []
-                file_id_to_key = {}
-                
-                for row in asset_rows:
-                    file_id = row["id"]
-                    s3_url = row["s3_url"]
-                    local_path = os.path.join(tmpdir, f"{file_id}.jpg")
-                    file_id_to_key[str(file_id)] = s3_url
-                    
-                    try:
-                        # Download image
-                        await asyncio.to_thread(_s3_download_to_file, s3_client, bucket, s3_url, local_path)
-                        
-                        # Pipeline steps
-                        pose = await asyncio.to_thread(parse_dji_metadata, local_path)
-                        dets = await asyncio.to_thread(detector.detect, local_path)
-                        
-                        if dets:
-                            fused_dets = await asyncio.to_thread(fuser.fuse, dets, pose)
-                            # Tag the detections with the original file_id
-                            for d in fused_dets:
-                                d.frame_id = str(file_id) # Override frame_id from local_path to file_id
-                            all_fused_detections.extend(fused_dets)
-                            
-                        # Annotate original image and upload to S3 (same as old logic, for visualization)
-                        if dets:
-                            img = await asyncio.to_thread(cv2.imread, local_path)
-                            # Convert dets to old format for annotation
-                            dict_dets = [
-                                {
-                                    "class_name": d.class_name, 
-                                    "confidence": d.confidence, 
-                                    "bbox": d.bbox.tolist()
-                                } 
-                                for d in dets
-                            ]
-                            annotated = await asyncio.to_thread(_annotate, img, dict_dets)
-                            output_key = _output_key(s3_url, tower_id, inspection_id, "asset")
-                            await asyncio.to_thread(_s3_upload, s3_client, bucket, annotated, output_key)
-                            logger.debug(f"[{file_id}] Annotated asset image uploaded → {output_key}")
-                            
-                    except Exception as e:
-                        logger.error(f"[{file_id}] Error processing asset image: {e}")
-                    finally:
-                        gc.collect()
 
-                # Deduplicate globally
-                logger.info(f"[{inspection_id}] Deduplicating {len(all_fused_detections)} total asset detections")
-                inventory = await asyncio.to_thread(deduper.deduplicate, all_fused_detections)
-                
-                # Write Asset DB records
-                async with pool.acquire() as conn:
-                    async with conn.transaction():
-                        for class_name, unique_dets in inventory.items():
-                            comp_id = await _upsert_component(conn, class_name)
-                            count = len(unique_dets)
-                            
-                            # Build metadata and insert 3D pins
-                            components_meta = []
-                            best_s3_url = ""
-                            
-                            for d in unique_dets:
-                                best_s3_url = file_id_to_key.get(d.frame_id, "")
-                                world_xyz_list = d.world_xyz.tolist() if d.world_xyz is not None else [0,0,0]
-                                
-                                components_meta.append({
-                                    "best_frame_id": d.frame_id,
-                                    "confidence": round(d.confidence, 3),
-                                    "world_xyz_m": world_xyz_list,
-                                    "bbox_pixels": d.bbox.tolist()
-                                })
-                                
-                                # 3b — create one 3D pin per *unique* detected object
-                                await _insert_3d_annotation(
-                                    conn, inspection_id, comp_id,
-                                    class_name.title(), world_xyz_list,
-                                )
+            # ------------------------------------------------------------------
+            # ASSETS — global deduplication pipeline
+            # ------------------------------------------------------------------
+            logger.info(f"[{inspection_id}] Processing {len(rows)} asset file(s) with deduplication")
+            detector = modules["detector"]
+            fuser    = modules["fuser"]
+            deduper  = modules["deduper"]
 
-                            # 3c — save global detection summary row for this class
-                            # We use the S3 URL of the last processed best_frame as a representative URL
-                            meta = {"components": components_meta, "label": class_name}
-                            
-                            await _insert_pvx_detection(
-                                conn, inspection_id, best_s3_url, meta, "asset", class_name, count
+            # file_id → {s3_url, local_path, raw_dets, annotated_img}
+            file_info: Dict[str, Dict] = {}
+            all_fused_detections = []
+
+            for row in rows:
+                file_id    = str(row["id"])
+                s3_url     = row["s3_url"]
+                local_path = os.path.join(tmpdir, f"{file_id}.jpg")
+
+                file_info[file_id] = {
+                    "s3_url":     s3_url,
+                    "local_path": local_path,
+                    "raw_dets":   [],
+                }
+
+                try:
+                    await asyncio.to_thread(
+                        _s3_download_to_file, s3_client, bucket, s3_url, local_path
+                    )
+                    pose = await asyncio.to_thread(parse_dji_metadata, local_path)
+                    dets = await asyncio.to_thread(detector.detect, local_path)
+
+                    if dets:
+                        fused_dets = await asyncio.to_thread(fuser.fuse, dets, pose)
+                        for d in fused_dets:
+                            d.frame_id = file_id
+                        all_fused_detections.extend(fused_dets)
+                        file_info[file_id]["raw_dets"] = dets
+
+                except Exception as e:
+                    logger.error(f"[{file_id}] Error in detection pass: {e}")
+                finally:
+                    gc.collect()
+
+            # ------------------------------------------------------------------
+            # Global deduplication
+            # ------------------------------------------------------------------
+            logger.info(
+                f"[{inspection_id}] Deduplicating {len(all_fused_detections)} total asset detections"
+            )
+            inventory = await asyncio.to_thread(deduper.deduplicate, all_fused_detections)
+
+            # Collect the set of file_ids that have at least one unique detection
+            unique_file_ids: set = set()
+            for unique_dets in inventory.values():
+                for d in unique_dets:
+                    unique_file_ids.add(d.frame_id)
+
+            logger.info(
+                f"[{inspection_id}] {len(unique_file_ids)} unique images after deduplication"
+            )
+
+            # ------------------------------------------------------------------
+            # Upload ONLY unique images and build per-image detection inserts
+            # ------------------------------------------------------------------
+            # file_id → output_s3_key (for unique images only)
+            unique_output_keys: Dict[str, str] = {}
+
+            for file_id in unique_file_ids:
+                info       = file_info[file_id]
+                raw_dets   = info["raw_dets"]
+                local_path = info["local_path"]
+                s3_url     = info["s3_url"]
+
+                try:
+                    img = await asyncio.to_thread(cv2.imread, local_path)
+                    dict_dets = [
+                        {
+                            "class_name": d.class_name,
+                            "confidence": d.confidence,
+                            "bbox":       d.bbox.tolist(),
+                        }
+                        for d in raw_dets
+                    ]
+                    annotated  = await asyncio.to_thread(_annotate, img, dict_dets)
+                    output_key = _output_key(s3_url, tower_id, inspection_id, "asset")
+                    await asyncio.to_thread(_s3_upload, s3_client, bucket, annotated, output_key)
+                    unique_output_keys[file_id] = output_key
+                    logger.debug(f"[{file_id}] Unique annotated image uploaded → {output_key}")
+                except Exception as e:
+                    logger.error(f"[{file_id}] Error uploading unique image: {e}")
+
+            # ------------------------------------------------------------------
+            # Write DB records: `detection` rows + inspection.asset_counts
+            # ------------------------------------------------------------------
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    # Track {component_uuid: total_unique_count} for asset_counts
+                    asset_counts: Dict[str, int] = {}
+
+                    for class_name, unique_dets in inventory.items():
+                        comp_id = await _upsert_component(conn, class_name)
+                        comp_id_str = str(comp_id)
+
+                        # Accumulate total unique count for this component
+                        asset_counts[comp_id_str] = len(unique_dets)
+
+                        # Insert one detection row per unique image for this component
+                        # Group unique detections by frame_id to get per-image counts
+                        frame_class_counts: Dict[str, int] = {}
+                        for d in unique_dets:
+                            frame_class_counts[d.frame_id] = (
+                                frame_class_counts.get(d.frame_id, 0) + 1
                             )
-                
-            # -------------------------------------------------------------
-            # DEFECTS (Old logic without deduplication)
-            # -------------------------------------------------------------
-            if defect_rows:
-                logger.info(f"[{inspection_id}] Processing {len(defect_rows)} defect file(s)")
-                
-                with _module_lock:
-                    if _modules["defect_model"] is None:
-                        logger.info(f"Loading defect YOLO model from {DEFECT_MODEL_PATH}")
-                        from ultralytics import YOLO
-                        _modules["defect_model"] = YOLO(DEFECT_MODEL_PATH)
-                        
-                defect_model = _modules["defect_model"]
-                device = _get_device()
-                
-                for row in defect_rows:
-                    file_id = row["id"]
-                    s3_url = row["s3_url"]
-                    local_path = os.path.join(tmpdir, f"{file_id}.jpg")
-                    
-                    try:
-                        await asyncio.to_thread(_s3_download_to_file, s3_client, bucket, s3_url, local_path)
-                        img = await asyncio.to_thread(cv2.imread, local_path)
-                        
-                        results = await asyncio.to_thread(
-                            defect_model.predict, img, conf=INFERENCE_CONF, verbose=False, device=device
+
+                        for frame_id, img_count in frame_class_counts.items():
+                            output_key = unique_output_keys.get(frame_id, "")
+                            if not output_key:
+                                continue  # image upload failed; skip
+                            await _insert_detection(
+                                conn,
+                                inspection_id,
+                                output_key,
+                                "asset",
+                                class_name,
+                                img_count,
+                            )
+
+                    # Update the inspection.asset_counts JSONB column
+                    if asset_counts:
+                        await _update_inspection_asset_counts(
+                            conn, inspection_id, asset_counts
                         )
-                        
-                        names = results[0].names
-                        detections = []
-                        for box in results[0].boxes:
-                            cid = int(box.cls[0])
-                            detections.append({
-                                "class_name": names[cid],
-                                "class_id":   cid,
-                                "confidence": round(float(box.conf[0]), 4),
-                                "bbox":       box.xyxy[0].tolist(),
-                            })
+                        logger.info(
+                            f"[{inspection_id}] Updated asset_counts: {asset_counts}"
+                        )
 
-                        class_summary = {}
-                        for d in detections:
-                            class_summary[d["class_name"]] = class_summary.get(d["class_name"], 0) + 1
-                        
-                        annotated = await asyncio.to_thread(_annotate, img.copy(), detections)
-                        output_key = _output_key(s3_url, tower_id, inspection_id, "defect")
-                        await asyncio.to_thread(_s3_upload, s3_client, bucket, annotated, output_key)
-                        
-                        # Write Defect DB records (per-image)
-                        async with pool.acquire() as conn:
-                            async with conn.transaction():
-                                for c_name, count in class_summary.items():
-                                    d_list = [d for d in detections if d["class_name"] == c_name]
-                                    meta = {
-                                        "confidence": max(d["confidence"] for d in d_list),
-                                        "bboxes": [d["bbox"] for d in d_list],
-                                        "label": c_name
-                                    }
-                                    await _insert_pvx_detection(
-                                        conn, inspection_id, output_key, meta, "defect", c_name, count
-                                    )
-                                    
-                    except Exception as e:
-                        logger.error(f"[{file_id}] Error processing defect image: {e}")
-                        async with pool.acquire() as conn:
-                            await _mark_failed(conn, file_id)
-                    finally:
-                        gc.collect()
-
-        # Mark all successfully processed files
+        # Mark all files as processed
         async with pool.acquire() as conn:
             for row in rows:
-                # Re-verify failure wasn't set 
-                # (For simplicity, we mark all as processed here if they reached this point)
                 await _mark_processed(conn, row["id"])
 
         logger.info(f"[{inspection_id}] DONE")
@@ -587,14 +545,14 @@ async def _tick(
     s3_client: Any,
     semaphore: asyncio.Semaphore,
 ) -> None:
+    """Claim one inspection's 'uploaded' mobile_images and dispatch processing."""
     # Claim the inspection batch atomically
     async with pool.acquire() as conn:
         async with conn.transaction():
             rows = await conn.fetch(CLAIM_INSPECTION_SQL)
             if rows:
-                # The FOR UPDATE SKIP LOCKED locks the rows. 
-                # We optionally update their status to processing now,
-                # though _process_inspection does it too. Doing it here prevents long lock holds.
+                # Pre-mark as 'processing' inside the transaction so the lock
+                # is released quickly while the heavy processing runs outside.
                 ids = [r["id"] for r in rows]
                 await conn.executemany(
                     "UPDATE pvx_file SET status = 'processing' WHERE id = $1",
@@ -602,7 +560,7 @@ async def _tick(
                 )
 
     if not rows:
-        logger.debug("No uploaded groundbasemobileimages found — sleeping.")
+        logger.debug("No uploaded mobile_images found — sleeping.")
         return
 
     logger.info(f"Claimed {len(rows)} file(s) for inspection {rows[0]['inspection_id']} for processing.")
@@ -611,7 +569,6 @@ async def _tick(
         async with semaphore:
             await _process_inspection(pool, s3_client, insp_rows)
 
-    # We only fetched one inspection's rows, so we just run it
     await asyncio.gather(_guarded(rows))
 
 
@@ -738,7 +695,7 @@ async def main() -> None:
 
     async with pool.acquire() as conn:
         await conn.execute(ENSURE_DETECTION_TABLE_SQL)
-        logger.info("pvx_detection table verified.")
+        logger.info("`detection` table verified.")
 
     semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 

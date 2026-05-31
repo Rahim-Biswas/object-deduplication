@@ -1,5 +1,6 @@
 import yaml
 import json
+import shutil
 from pathlib import Path
 from tqdm import tqdm
 import gc  # For memory cleanup
@@ -63,8 +64,9 @@ def run_pipeline(image_dir: str, config_path: str = "config.yaml"):
     # Step 4: Deduplicate globally across all frames
     inventory = deduper.deduplicate(all_detections)
 
-    # Step 5: Build JSON output
+    # Step 5: Build JSON output and collect unique frames
     report = {}
+    unique_frames = set()
     for cls_name, unique_dets in inventory.items():
         report[cls_name] = {
             "count": len(unique_dets),
@@ -78,10 +80,22 @@ def run_pipeline(image_dir: str, config_path: str = "config.yaml"):
                 for d in unique_dets
             ]
         }
+        for d in unique_dets:
+            unique_frames.add(d.frame_id)
 
-    Path("outputs").mkdir(exist_ok=True)
-    with open("outputs/inventory.json", "w") as f:
+    # Set output directory to be the same as input folder name
+    output_dir = Path(image_dir).name
+    Path(output_dir).mkdir(exist_ok=True, parents=True)
+    
+    with open(f"{output_dir}/inventory.json", "w") as f:
         json.dump(report, f, indent=2)
+
+    # Save unique detected images
+    print(f"\nSaving {len(unique_frames)} unique detected images to {output_dir}/...")
+    for frame_path in tqdm(unique_frames, desc="Saving images"):
+        dest_path = Path(output_dir) / Path(frame_path).name
+        if Path(frame_path).resolve() != dest_path.resolve():
+            shutil.copy(frame_path, dest_path)
 
     # Print summary
     print("\n===== COMPONENT INVENTORY =====")
@@ -90,7 +104,7 @@ def run_pipeline(image_dir: str, config_path: str = "config.yaml"):
         print(f"  {cls_name}: {data['count']} unique components")
         total += data["count"]
     print(f"  TOTAL: {total} components")
-    print("Output saved to outputs/inventory.json")
+    print(f"Output saved to {output_dir}/inventory.json")
 
     return report
 
