@@ -26,8 +26,8 @@ dedup:
 # YOLO settings
 yolo:
   model_path: "models/tower_asset_detection_v1.pt"
-  conf_threshold: 0.35
-  iou_threshold: 0.45
+  conf_threshold: 0.80
+  iou_threshold: 0.60
 
 # Max image dimension for processing (helps with memory usage on large images)
 # Larger images will be resized maintaining aspect ratio
